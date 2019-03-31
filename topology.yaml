@@ -93,3 +93,6 @@ start args:
     --ssl:
         choices: ['encryption', 'authentication']
         help: If specified, enable SSL encryption or authentication for one or more cluster services
+    --st-version:
+        help: If specified, the version of StreamSets Transformer to install
+        metavar: ver

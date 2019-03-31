@@ -21,7 +21,7 @@ from configobj import ConfigObj
 from clusterdock.models import Cluster, client, Node
 from clusterdock.utils import nested_get, wait_for_condition
 
-from topology_cdh import cm, sdc
+from topology_cdh import cm, sdc, st
 
 DEFAULT_NAMESPACE = 'streamsets'
 
@@ -109,6 +109,13 @@ def main(args):
     secondary_node_image = '{}_{}'.format(image_prefix, 'secondary-node')
     single_node_image = '{}_{}'.format(image_prefix, 'single-node')
 
+    # Docker for Mac exposes ports that can be accessed only with ``localhost:<port>`` so
+    # use that instead of the hostname if the host name is ``moby``.
+    if any(docker_for_mac_name in client.info().get('Name', '') for docker_for_mac_name in ['moby', 'linuxkit']):
+        hostname = 'localhost'
+    else:
+        hostname = socket.gethostbyname(socket.gethostname())
+
     # Docker's API for healthcheck uses units of nanoseconds. Define a constant
     # to make this more readable.
     SECONDS = 1000000000
@@ -126,6 +133,12 @@ def main(args):
     volumes = [{clusterdock_config_host_dir: CLUSTERDOCK_CLIENT_CONTAINER_DIR}]
     if args.sdc_version:
         ports.append({sdc.SDC_PORT: sdc.SDC_PORT} if args.predictable else sdc.SDC_PORT)
+
+    transformer = None
+    if args.st_version:
+        transformer = st.Transformer(args.st_version, args.namespace or DEFAULT_NAMESPACE, args.registry)
+        ports.append({st.ST_PORT: st.ST_PORT} if args.predictable else st.ST_PORT)
+
     primary_node = Node(hostname=args.primary_node[0], group='primary',
                         image=primary_node_image if not args.single_node else single_node_image,
                         ports=ports,
@@ -157,6 +170,15 @@ def main(args):
             logger.debug('Adding Spark2 parcel image %s to CM nodes ...', spark2_parcel_image)
             for node in nodes:
                 node.volumes.append(spark2_parcel_image)
+
+    if transformer:
+        logger.debug('Adding Transformer image %s to primary node ...', transformer.image_name)
+        primary_node.volumes.append(transformer.image_name)
+
+        logger.debug('Adding Transformer extra lib images to primary node ...')
+        primary_node.volumes.extend(transformer.extra_lib_images)
+
+        primary_node.environment.update(transformer.environment)
 
     if args.sdc_version:
         logger.info('args.sdc_version = %s', args.sdc_version)
@@ -198,6 +220,20 @@ def main(args):
 
     # Keep track of whether to suppress DEBUG-level output in commands.
     quiet = not args.verbose
+
+    if transformer:
+        logger.debug('Adding user %s for Transformer ...', st.ST_USER)
+        for command in transformer.commands_for_add_user():
+            primary_node.execute(command, quiet=quiet)
+
+        logger.info('Running Transformer as user %s ...', st.ST_USER)
+        primary_node.execute(transformer.command_for_execute(), user=st.ST_USER, detach=True)
+
+        def condition(command):
+            return primary_node.execute(command, quiet=quiet).exit_code == 0
+        wait_for_condition(condition, ['netstat -tulpn | grep LISTEN | grep {}'.format(st.ST_PORT)])
+        st_http_url = 'http://{}:{}'.format(hostname, primary_node.host_ports.get(st.ST_PORT))
+        logger.info('Transformer is now reachable at %s', st_http_url)
 
     if args.spark2_version and 'SPARK2_ON_YARN' in services_to_add:
         # Install is needed only when Spark2 is not integrated.
@@ -262,12 +298,6 @@ def main(args):
     logger.info('Waiting for Cloudera Manager server to come online ...')
     _wait_for_cm_server(primary_node)
 
-    # Docker for Mac exposes ports that can be accessed only with ``localhost:<port>`` so
-    # use that instead of the hostname if the host name is ``moby``.
-    if any(docker_for_mac_name in client.info().get('Name', '') for docker_for_mac_name in ['moby', 'linuxkit']):
-        hostname = 'localhost'
-    else:
-        hostname = socket.gethostbyname(socket.gethostname())
     port = primary_node.host_ports.get(CM_PORT)
     server_url = 'http://{}:{}'.format(hostname, port)
     logger.info('Cloudera Manager server is now reachable at %s', server_url)
